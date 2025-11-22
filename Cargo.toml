@@ -1,0 +1,12 @@
+[package]
+name = "account"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+frontbridge = { path = "../frontbridge" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tauri = { version = "2.9.2", features = ["rustls-tls"] }
