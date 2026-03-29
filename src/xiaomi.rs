@@ -4,13 +4,13 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{anyhow, Result};
-use base64::engine::general_purpose;
+use anyhow::{Result, anyhow};
 use base64::Engine;
+use base64::engine::general_purpose;
 use cipher::StreamCipher;
 use md5::Md5;
-use rand::{distributions::Uniform, rngs::OsRng, Rng};
-use rc4::{consts::U32, KeyInit, Rc4};
+use rand::{Rng, distributions::Uniform, rngs::OsRng};
+use rc4::{KeyInit, Rc4, consts::U32};
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest_cookie_store::{CookieStore, CookieStoreMutex, RawCookie};
 use serde::{Deserialize, Serialize};
@@ -130,11 +130,7 @@ fn generate_nonce(millis: u64) -> String {
 /// 6-character lowercase device id.
 fn random_device_id() -> String {
     let range = Uniform::from(b'a'..=b'z');
-    OsRng
-        .sample_iter(&range)
-        .take(6)
-        .map(char::from)
-        .collect()
+    OsRng.sample_iter(&range).take(6).map(char::from).collect()
 }
 
 /// SHA-256( ssecurity_b64_dec + nonce_b64_dec ) → Base64.
@@ -202,21 +198,15 @@ pub async fn mi_service_call_encrypted(
     mut params_plain: HashMap<String, String>,
     ua: String,
 ) -> Result<String> {
-    let client = crate::net::default_client_builder()
-        .build()?;
+    let client = crate::net::default_client_builder().build()?;
 
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)?
-        .as_millis() as u64;
+    let millis = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
     let nonce = generate_nonce(millis);
     let signed_nonce = calc_signed_nonce(&token.ssecurity, &nonce)?;
 
     // Path for signature
     let url_parsed = Url::parse(&url)?;
-    let url_path = url_parsed
-        .path()
-        .trim_start_matches(&prefix)
-        .to_string();
+    let url_path = url_parsed.path().trim_start_matches(&prefix).to_string();
 
     // 1. rc4_hash__ over *plain* params
     let rc4_hash = generate_enc_signature(&url_path, "POST", &signed_nonce, &params_plain);
@@ -270,7 +260,11 @@ pub async fn mi_service_call_encrypted(
 }
 
 /// Log in and obtain `MiAccountToken`.
-pub async fn login_mi_account(username: String, password: String, ua: String) -> Result<MiAccountToken> {
+pub async fn login_mi_account(
+    username: String,
+    password: String,
+    ua: String,
+) -> Result<MiAccountToken> {
     let device_id = random_device_id();
     let sdk_version = "accountsdk-18.8.15";
 
@@ -280,17 +274,18 @@ pub async fn login_mi_account(username: String, password: String, ua: String) ->
         .build()?;
 
     // Pre-seed cookies on mi.com + xiaomi.com + account.xiaomi.com
-    for domain in ["https://mi.com", "https://xiaomi.com", "https://account.xiaomi.com"] {
+    for domain in [
+        "https://mi.com",
+        "https://xiaomi.com",
+        "https://account.xiaomi.com",
+    ] {
         let url = Url::parse(domain)?;
         let mut store = cookie_store.lock().unwrap();
         store.insert_raw(&RawCookie::new("sdkVersion", sdk_version), &url)?;
         store.insert_raw(&RawCookie::new("deviceId", device_id.clone()), &url)?;
         if domain.contains("xiaomi.com") {
             // Ensure userId is available to account.xiaomi.com just like Python implementation.
-            let raw = RawCookie::parse(format!(
-                "userId={}; Domain=.xiaomi.com; Path=/",
-                username
-            ))?;
+            let raw = RawCookie::parse(format!("userId={}; Domain=.xiaomi.com; Path=/", username))?;
             store.insert_raw(&raw, &url)?;
         }
     }
@@ -306,8 +301,7 @@ pub async fn login_mi_account(username: String, password: String, ua: String) ->
     if step1.status() != 200 {
         return Err(anyhow!("serviceLogin failed: {}", step1.status()));
     }
-    let sign_resp: ServiceLoginRespone =
-        serde_json::from_str(strip_prefix(&step1.text().await?))?;
+    let sign_resp: ServiceLoginRespone = serde_json::from_str(strip_prefix(&step1.text().await?))?;
     let sign = sign_resp.sign;
 
     if sign.is_empty() {
@@ -345,9 +339,7 @@ pub async fn login_mi_account(username: String, password: String, ua: String) ->
     if auth_resp.code != 0 || auth_resp.ssecurity.is_empty() {
         match auth_resp.code {
             0 => {}
-            70016 => {
-                return Err(anyhow!("登录失败：用户名或密码错误"))
-            }
+            70016 => return Err(anyhow!("登录失败：用户名或密码错误")),
             _ => {
                 return Err(anyhow!(
                     "未知错误：serviceLoginAuth error: code={}, description={}",
@@ -359,10 +351,7 @@ pub async fn login_mi_account(username: String, password: String, ua: String) ->
     }
 
     if let Some(url) = &auth_resp.notification_url {
-        return Err(anyhow!(
-            "2-f-a={}",
-            url
-        ))
+        return Err(anyhow!("2-f-a={}", url));
     }
 
     // --- Step 3: follow redirect to obtain serviceToken ---

@@ -1,7 +1,7 @@
 pub mod models;
+pub mod net;
 pub mod storage;
 pub mod xiaomi;
-pub mod net;
 
 use crate::models::AccountRecord;
 use async_trait::async_trait;
