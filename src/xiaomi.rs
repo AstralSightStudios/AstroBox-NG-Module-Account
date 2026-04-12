@@ -4,9 +4,11 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use aes::Aes128;
 use anyhow::{Result, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose;
+use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
 use cipher::StreamCipher;
 use md5::Md5;
 use rand::{Rng, distributions::Uniform, rngs::OsRng};
@@ -17,6 +19,11 @@ use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use url::Url;
+
+type Aes128CbcEncryptor = cbc::Encryptor<Aes128>;
+type Aes128CbcDecryptor = cbc::Decryptor<Aes128>;
+
+const ACCOUNT_AES_IV: &[u8; 16] = b"0102030405060708";
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ServiceLoginAuthRespone {
@@ -123,6 +130,72 @@ pub struct MiNotificationAuthResult {
     pub psecurity_slh: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MiUserCoreInfo {
+    #[serde(default)]
+    pub user_id: String,
+    #[serde(default)]
+    pub user_name: String,
+    #[serde(default)]
+    pub nick_name: String,
+    #[serde(default)]
+    pub avatar_address: String,
+    #[serde(default)]
+    pub safe_phone: String,
+    #[serde(default)]
+    pub email_address: String,
+    #[serde(default)]
+    pub locale: String,
+    #[serde(default)]
+    pub region: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MiLatestVersion {
+    #[serde(default)]
+    pub version: String,
+    #[serde(rename = "safe_url", default)]
+    pub full_package_url: String,
+    #[serde(rename = "changeLog", default)]
+    pub change_log: String,
+    #[serde(default)]
+    pub md5: String,
+    #[serde(rename = "upload_time")]
+    pub upload_time: Option<i64>,
+    #[serde(rename = "diff_safe_url", default)]
+    pub diff_url: String,
+    #[serde(rename = "diff_md5", default)]
+    pub diff_md5: String,
+    #[serde(default)]
+    pub force: bool,
+}
+
+impl MiLatestVersion {
+    pub fn is_valid(&self) -> bool {
+        !self.version.trim().is_empty()
+    }
+
+    pub fn download_url(&self) -> Option<&str> {
+        if !self.diff_url.trim().is_empty() {
+            Some(self.diff_url.trim())
+        } else if !self.full_package_url.trim().is_empty() {
+            Some(self.full_package_url.trim())
+        } else {
+            None
+        }
+    }
+
+    pub fn download_md5(&self) -> Option<&str> {
+        if !self.diff_url.trim().is_empty() && !self.diff_md5.trim().is_empty() {
+            Some(self.diff_md5.trim())
+        } else if !self.md5.trim().is_empty() {
+            Some(self.md5.trim())
+        } else {
+            None
+        }
+    }
+}
+
 /// Remove Xiaomi’s magic prefix from JSON payloads.
 fn strip_prefix(contents: &str) -> &str {
     const PREFIX: &str = "&&&START&&&";
@@ -143,6 +216,104 @@ fn generate_nonce(millis: u64) -> String {
 fn random_device_id() -> String {
     let range = Uniform::from(b'a'..=b'z');
     OsRng.sample_iter(&range).take(6).map(char::from).collect()
+}
+
+fn random_request_id(len: usize) -> String {
+    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let range = Uniform::from(0..CHARSET.len());
+    OsRng
+        .sample_iter(&range)
+        .take(len)
+        .map(|index| CHARSET[index] as char)
+        .collect()
+}
+
+fn append_avatar_size_suffix(icon: &str) -> String {
+    const SUFFIX: &str = "_320";
+    let Some(dot_index) = icon.rfind('.') else {
+        return icon.to_string();
+    };
+    if dot_index == 0 {
+        return icon.to_string();
+    }
+    format!("{}{}{}", &icon[..dot_index], SUFFIX, &icon[dot_index..])
+}
+
+fn aes_encrypt_base64(security: &str, value: &str) -> Result<String> {
+    let key = general_purpose::STANDARD
+        .decode(security)
+        .map_err(|err| anyhow!("decode account security failed: {err}"))?;
+    let cipher = Aes128CbcEncryptor::new_from_slices(&key, ACCOUNT_AES_IV)
+        .map_err(|err| anyhow!("init account aes encryptor failed: {err}"))?;
+    let plain = value.as_bytes();
+    let mut buffer = vec![0u8; plain.len() + 16];
+    buffer[..plain.len()].copy_from_slice(plain);
+    let encrypted = cipher
+        .encrypt_padded_mut::<Pkcs7>(&mut buffer, plain.len())
+        .map_err(|err| anyhow!("encrypt account payload failed: {err}"))?;
+    Ok(general_purpose::STANDARD.encode(encrypted))
+}
+
+fn aes_decrypt_base64(security: &str, value: &str) -> Result<String> {
+    let key = general_purpose::STANDARD
+        .decode(security)
+        .map_err(|err| anyhow!("decode account security failed: {err}"))?;
+    let cipher = Aes128CbcDecryptor::new_from_slices(&key, ACCOUNT_AES_IV)
+        .map_err(|err| anyhow!("init account aes decryptor failed: {err}"))?;
+    let mut buffer = general_purpose::STANDARD
+        .decode(value)
+        .map_err(|err| anyhow!("decode encrypted account response failed: {err}"))?;
+    let decrypted = cipher
+        .decrypt_padded_mut::<Pkcs7>(&mut buffer)
+        .map_err(|err| anyhow!("decrypt account response failed: {err}"))?;
+    String::from_utf8(decrypted.to_vec())
+        .map_err(|err| anyhow!("decode account response as utf-8 failed: {err}"))
+}
+
+fn generate_account_signature(
+    method: &str,
+    url: &str,
+    params: &HashMap<String, String>,
+    security: &str,
+) -> Result<String> {
+    if security.trim().is_empty() {
+        return Err(anyhow!("account security is empty"));
+    }
+
+    let parsed_url = Url::parse(url)?;
+    let mut keys: Vec<&String> = params.keys().collect();
+    keys.sort();
+
+    let mut pieces = Vec::with_capacity(2 + keys.len() + 1);
+    pieces.push(method.to_uppercase());
+    pieces.push(parsed_url.path().to_string());
+    for key in keys {
+        pieces.push(format!("{key}={}", params.get(key).unwrap()));
+    }
+    pieces.push(security.to_string());
+
+    let raw = pieces.join("&");
+    let mut sha1 = Sha1::default();
+    sha1.update(raw.as_bytes());
+    Ok(general_purpose::STANDARD.encode(sha1.finalize()))
+}
+
+fn parse_response_code(value: &serde_json::Value) -> i64 {
+    value
+        .get("code")
+        .and_then(|raw| raw.as_i64().or_else(|| raw.as_str()?.parse::<i64>().ok()))
+        .unwrap_or(-1)
+}
+
+fn parse_response_message(value: &serde_json::Value) -> String {
+    for key in ["msg", "message", "description"] {
+        if let Some(message) = value.get(key).and_then(|raw| raw.as_str()) {
+            if !message.trim().is_empty() {
+                return message.to_string();
+            }
+        }
+    }
+    String::new()
 }
 
 fn insert_cookie_header(store: &mut CookieStore, url: &Url, cookie_header: &str) -> Result<()> {
@@ -375,14 +546,34 @@ fn rc4_encrypt_params(
     Ok(encrypted)
 }
 
-/// Main encrypted API call.
-/// `prefix` – path prefix that should be trimmed before signing (usually "")
-pub async fn mi_service_call_encrypted(
+fn resolve_service_signature_path(path: &str, path_prefix: &str) -> String {
+    let trimmed_prefix = path_prefix.trim();
+    let mut subpath = if trimmed_prefix.is_empty() {
+        match path.find('/') {
+            Some(index) => path[index..].to_string(),
+            None => path.to_string(),
+        }
+    } else if let Some(index) = path.find(trimmed_prefix) {
+        path[index + trimmed_prefix.len()..].to_string()
+    } else {
+        path.to_string()
+    };
+
+    if !subpath.starts_with('/') {
+        subpath.insert(0, '/');
+    }
+    subpath
+}
+
+async fn mi_service_call_encrypted_internal(
     token: MiAccountToken,
-    prefix: String,
+    path_prefix: String,
     url: String,
-    mut params_plain: HashMap<String, String>,
+    mut signed_form_params: HashMap<String, String>,
+    passthrough_form_params: HashMap<String, String>,
+    query_params: HashMap<String, String>,
     ua: String,
+    cookie_locale: Option<String>,
 ) -> Result<String> {
     let client = crate::net::default_client_builder().build()?;
 
@@ -390,23 +581,20 @@ pub async fn mi_service_call_encrypted(
     let nonce = generate_nonce(millis);
     let signed_nonce = calc_signed_nonce(&token.ssecurity, &nonce)?;
 
-    // Path for signature
     let url_parsed = Url::parse(&url)?;
-    let url_path = url_parsed.path().trim_start_matches(&prefix).to_string();
+    let url_path = resolve_service_signature_path(url_parsed.path(), &path_prefix);
 
-    // 1. rc4_hash__ over *plain* params
-    let rc4_hash = generate_enc_signature(&url_path, "POST", &signed_nonce, &params_plain);
-    params_plain.insert("rc4_hash__".to_string(), rc4_hash);
+    let rc4_hash = generate_enc_signature(&url_path, "POST", &signed_nonce, &signed_form_params);
+    signed_form_params.insert("rc4_hash__".to_string(), rc4_hash);
 
-    // 2. RC4-encrypt all fields
-    let mut params_enc = rc4_encrypt_params(&signed_nonce, &params_plain)?;
+    let mut encrypted_params = rc4_encrypt_params(&signed_nonce, &signed_form_params)?;
+    let signature = generate_enc_signature(&url_path, "POST", &signed_nonce, &encrypted_params);
+    encrypted_params.insert("signature".into(), signature);
+    encrypted_params.insert("_nonce".into(), nonce.clone());
 
-    // 3. Final signature & nonce
-    let sig = generate_enc_signature(&url_path, "POST", &signed_nonce, &params_enc);
-    params_enc.insert("signature".into(), sig);
-    params_enc.insert("_nonce".into(), nonce.clone());
+    let mut form_params = passthrough_form_params;
+    form_params.extend(encrypted_params);
 
-    // 4. Headers & cookies
     let mut headers = HeaderMap::new();
     headers.insert("User-Agent", HeaderValue::from_str(&ua)?);
     headers.insert("region_tag", HeaderValue::from_static("cn"));
@@ -414,7 +602,13 @@ pub async fn mi_service_call_encrypted(
 
     let mut cookie_parts = vec![
         "sdkVersion=accountsdk-18.8.15".to_string(),
-        "locale=en_us".to_string(),
+        format!(
+            "locale={}",
+            cookie_locale
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("en_us")
+        ),
     ];
     if !token.device_id.trim().is_empty() {
         cookie_parts.push(format!("deviceId={}", token.device_id));
@@ -422,35 +616,27 @@ pub async fn mi_service_call_encrypted(
     if !token.user_id.trim().is_empty() {
         cookie_parts.push(format!("userId={}", token.user_id));
     }
-    cookie_parts.push(format!("cUserId={}", token.c_user_id));
+    if !token.c_user_id.trim().is_empty() {
+        cookie_parts.push(format!("cUserId={}", token.c_user_id));
+    }
     cookie_parts.push(format!("serviceToken={}", token.service_token));
     let cookie_header = cookie_parts.join("; ");
 
-    log::info!(
-        "[MiAccount.DeviceList] request cookie device_id={} user_id={} c_user_id={} service_token_len={}",
-        token.device_id,
-        token.user_id,
-        token.c_user_id,
-        token.service_token.len()
-    );
-
-    // 5. Request
-    let resp = client
+    let response = client
         .post(url)
         .headers(headers)
         .header("Cookie", cookie_header)
-        .form(&params_enc)
+        .query(&query_params)
+        .form(&form_params)
         .send()
         .await?;
 
-    let status = resp.status();
-    let body = resp.text().await?;
-
+    let status = response.status();
+    let body = response.text().await?;
     if !status.is_success() {
         return Err(anyhow!("Mi API call failed: {}, body: {}", status, body));
     }
 
-    // 6. Decrypt
     let key_bytes = general_purpose::STANDARD.decode(&signed_nonce)?;
     let key = rc4::Key::<U32>::from_slice(&key_bytes);
     let mut cipher = Rc4::<U32>::new(key);
@@ -460,6 +646,297 @@ pub async fn mi_service_call_encrypted(
     let mut data = general_purpose::STANDARD.decode(body.trim_matches('"'))?;
     cipher.apply_keystream(&mut data);
     Ok(String::from_utf8_lossy(&data).into_owned())
+}
+
+/// Main encrypted API call.
+/// `prefix` – path prefix that should be trimmed before signing (usually "").
+pub async fn mi_service_call_encrypted(
+    token: MiAccountToken,
+    prefix: String,
+    url: String,
+    params_plain: HashMap<String, String>,
+    ua: String,
+) -> Result<String> {
+    mi_service_call_encrypted_internal(
+        token,
+        prefix,
+        url,
+        params_plain,
+        HashMap::new(),
+        HashMap::new(),
+        ua,
+        None,
+    )
+    .await
+}
+
+pub async fn fetch_mi_user_core_info(
+    token: MiAccountToken,
+    locale: Option<String>,
+) -> Result<MiUserCoreInfo> {
+    let locale = locale
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "en_US".to_string());
+    let mut params = HashMap::new();
+    params.insert("userId".to_string(), token.user_id.clone());
+    params.insert("transId".to_string(), random_request_id(15));
+    params.insert("flags".to_string(), "11".to_string());
+
+    let mut encrypted_params = HashMap::new();
+    for (key, value) in params {
+        encrypted_params.insert(key, aes_encrypt_base64(&token.ssecurity, &value)?);
+    }
+    let signature = generate_account_signature(
+        "GET",
+        "https://api.account.xiaomi.com/pass/v2/safe/user/coreInfo",
+        &encrypted_params,
+        &token.ssecurity,
+    )?;
+    encrypted_params.insert("signature".to_string(), signature);
+
+    let mut cookie_parts = vec![
+        format!("serviceToken={}", token.service_token),
+        format!("uLocale={locale}"),
+    ];
+    if !token.c_user_id.trim().is_empty() {
+        cookie_parts.push(format!("cUserId={}", token.c_user_id));
+    } else if !token.user_id.trim().is_empty() {
+        cookie_parts.push(format!("userId={}", token.user_id));
+    }
+    if !token.device_id.trim().is_empty() {
+        cookie_parts.push(format!("deviceId={}", token.device_id));
+    }
+
+    let response = crate::net::default_client_builder()
+        .build()?
+        .get("https://api.account.xiaomi.com/pass/v2/safe/user/coreInfo")
+        .header("Cookie", cookie_parts.join("; "))
+        .query(&encrypted_params)
+        .send()
+        .await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        return Err(anyhow!(
+            "fetch mi user core info failed: {}, body: {}",
+            status,
+            body
+        ));
+    }
+
+    let decrypted_body = aes_decrypt_base64(&token.ssecurity, body.trim())?;
+    let payload: serde_json::Value = serde_json::from_str(&decrypted_body)?;
+    let code = parse_response_code(&payload);
+    if code != 0 {
+        return Err(anyhow!(
+            "fetch mi user core info failed: code={}, msg={}",
+            code,
+            parse_response_message(&payload)
+        ));
+    }
+
+    let data = payload
+        .get("data")
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| anyhow!("mi user core info missing data field"))?;
+
+    let mut profile = MiUserCoreInfo {
+        user_id: data
+            .get("userId")
+            .and_then(|value| value.as_str())
+            .unwrap_or(token.user_id.as_str())
+            .to_string(),
+        user_name: data
+            .get("userName")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        nick_name: data
+            .get("nickName")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        avatar_address: data
+            .get("icon")
+            .and_then(|value| value.as_str())
+            .map(append_avatar_size_suffix)
+            .unwrap_or_default(),
+        locale: data
+            .get("locale")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        region: data
+            .get("region")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        ..Default::default()
+    };
+
+    if let Some(addresses) = data.get("userAddresses").and_then(|value| value.as_array()) {
+        for address in addresses {
+            let Some(address_type) = address
+                .get("addressType")
+                .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse::<i64>().ok()))
+            else {
+                continue;
+            };
+            let Some(raw_address) = address.get("address").and_then(|value| value.as_str()) else {
+                continue;
+            };
+            let flags = address
+                .get("flags")
+                .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse::<i64>().ok()))
+                .unwrap_or(0);
+            let is_primary = (flags & 2) != 0;
+
+            match address_type {
+                1 if is_primary => {
+                    profile.safe_phone = raw_address.to_string();
+                }
+                2 if is_primary => {
+                    profile.email_address = raw_address.to_string();
+                }
+                9 => {
+                    profile.nick_name = raw_address
+                        .strip_suffix("@ALIAS")
+                        .unwrap_or(raw_address)
+                        .to_string();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(profile)
+}
+
+pub async fn fetch_mi_latest_version(
+    token: MiAccountToken,
+    did: String,
+    model: String,
+    app_level: u64,
+    firmware_version: String,
+    locale: String,
+    ua: String,
+) -> Result<MiLatestVersion> {
+    let mut signed_form = HashMap::new();
+    signed_form.insert(
+        "data".to_string(),
+        serde_json::json!({
+            "did": did,
+            "model": model,
+            "platform": "a",
+            "app_level": app_level.to_string(),
+            "fw_ver": firmware_version,
+            "channel": "prod",
+        })
+        .to_string(),
+    );
+
+    let mut query = HashMap::new();
+    query.insert("locale".to_string(), locale.clone());
+
+    let body = mi_service_call_encrypted_internal(
+        token,
+        "/healthapp/".to_string(),
+        "https://hlth.io.mi.com/healthapp/device/latest_ver".to_string(),
+        signed_form,
+        HashMap::new(),
+        query,
+        ua,
+        Some(locale.clone()),
+    )
+    .await?;
+
+    let payload: serde_json::Value = serde_json::from_str(&body)?;
+    let code = parse_response_code(&payload);
+    if code != 0 && code != 200 {
+        return Err(anyhow!(
+            "fetch mi latest version failed: code={}, msg={}",
+            code,
+            parse_response_message(&payload)
+        ));
+    }
+
+    let result = payload
+        .get("result")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    serde_json::from_value(result).map_err(|err| anyhow!("decode mi latest version failed: {err}"))
+}
+
+pub async fn report_mi_device_info(
+    token: MiAccountToken,
+    did: String,
+    firmware_version: String,
+    ua: String,
+) -> Result<()> {
+    let mut signed_form = HashMap::new();
+    signed_form.insert(
+        "data".to_string(),
+        serde_json::json!({
+            "did": did,
+            "fw_ver": firmware_version,
+        })
+        .to_string(),
+    );
+
+    let body = mi_service_call_encrypted_internal(
+        token,
+        "/healthapp/".to_string(),
+        "https://hlth.io.mi.com/healthapp/device/bledevice_info".to_string(),
+        signed_form,
+        HashMap::new(),
+        HashMap::new(),
+        ua,
+        None,
+    )
+    .await?;
+
+    let payload: serde_json::Value = serde_json::from_str(&body)?;
+    let code = parse_response_code(&payload);
+    if code != 0 && code != 200 {
+        return Err(anyhow!(
+            "report mi device info failed: code={}, msg={}",
+            code,
+            parse_response_message(&payload)
+        ));
+    }
+
+    Ok(())
+}
+
+pub fn compare_firmware_versions(latest_version: &str, current_version: &str) -> i32 {
+    fn parse_triplet(input: &str) -> Option<[u64; 3]> {
+        let mut parts = input.trim().split('.');
+        let major = parts.next()?.parse::<u64>().ok()?;
+        let minor = parts.next()?.parse::<u64>().ok()?;
+        let patch = parts.next()?.parse::<u64>().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some([major, minor, patch])
+    }
+
+    let Some(latest) = parse_triplet(latest_version) else {
+        return 0;
+    };
+    let Some(current) = parse_triplet(current_version) else {
+        return 0;
+    };
+
+    for index in 0..3 {
+        if latest[index] > current[index] {
+            return 1;
+        }
+        if latest[index] < current[index] {
+            return -1;
+        }
+    }
+
+    0
 }
 
 /// Log in and obtain `MiAccountToken`.
