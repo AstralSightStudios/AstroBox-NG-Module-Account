@@ -5,7 +5,7 @@ use std::{
 };
 
 use aes::Aes128;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose;
 use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
@@ -15,7 +15,7 @@ use rand::{Rng, distributions::Uniform, rngs::OsRng};
 use rc4::{KeyInit, Rc4, consts::U32};
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest_cookie_store::{CookieStore, CookieStoreMutex, RawCookie};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -196,6 +196,213 @@ impl MiLatestVersion {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MiWatchfaceLabel {
+    #[serde(default)]
+    pub label_id: String,
+    #[serde(default)]
+    pub label_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MiWatchfaceIcon {
+    #[serde(default)]
+    pub icon: String,
+    #[serde(default)]
+    pub aod_icon: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MiWatchfaceData {
+    #[serde(default)]
+    pub spu_id: String,
+    #[serde(default)]
+    pub spu_version: i64,
+    #[serde(default)]
+    pub sku_id: String,
+    #[serde(default)]
+    pub purchase_type: Option<i64>,
+    #[serde(default)]
+    pub purchase_status: i64,
+    #[serde(default)]
+    pub price: u64,
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub icon: String,
+    #[serde(default)]
+    pub aod_icon: String,
+    #[serde(rename = "watch_face_version", default)]
+    pub version_code: Option<u64>,
+    #[serde(default)]
+    pub package_name: String,
+    #[serde(default)]
+    pub package_name_hash: String,
+    #[serde(default)]
+    pub introduction: String,
+    #[serde(default)]
+    pub publish_name: String,
+    #[serde(default)]
+    pub config_file: String,
+    #[serde(default)]
+    pub file_hash: String,
+    #[serde(default)]
+    pub file_size: u64,
+    #[serde(default)]
+    pub file_hash_v2: String,
+    #[serde(default)]
+    pub file_size_v2: Option<u64>,
+    #[serde(default)]
+    pub download_count: i64,
+    #[serde(default)]
+    pub label_list: Vec<MiWatchfaceLabel>,
+    #[serde(default)]
+    pub icon_list: Vec<MiWatchfaceIcon>,
+}
+
+impl MiWatchfaceData {
+    pub fn is_purchase_face(&self) -> bool {
+        self.purchase_type.unwrap_or_default() == 21
+    }
+
+    pub fn can_purchase(&self) -> bool {
+        self.is_purchase_face() && self.purchase_status == 0
+    }
+
+    pub fn is_vip(&self) -> bool {
+        self.is_purchase_face() && self.purchase_status == 2
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MiWatchfaceIndexItem {
+    #[serde(default)]
+    pub key: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(rename = "watchface_list", default)]
+    pub watchface_list: Vec<MiWatchfaceData>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MiWatchfaceIndexResult {
+    #[serde(rename = "in_white_list", default)]
+    pub in_white_list: bool,
+    #[serde(rename = "resource_pool_list", default)]
+    pub resource_pool_list: Vec<MiWatchfaceIndexItem>,
+    #[serde(rename = "feed_watchface_list", default)]
+    pub feed_watchface_list: Vec<MiWatchfaceData>,
+    #[serde(rename = "has_more", default)]
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MiWatchfaceDetailResult {
+    #[serde(rename = "watch_face")]
+    pub watch_face: MiWatchfaceData,
+    #[serde(default)]
+    pub recommend_list: Vec<MiWatchfaceData>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MiWatchfaceDownloadInfo {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub config_file: Option<String>,
+    #[serde(default)]
+    pub file_hash: Option<String>,
+    #[serde(default)]
+    pub file_size: u64,
+    #[serde(default)]
+    pub config_file_v2: Option<String>,
+    #[serde(default)]
+    pub file_hash_v2: Option<String>,
+    #[serde(default)]
+    pub file_size_v2: u64,
+}
+
+impl MiWatchfaceDownloadInfo {
+    pub fn preferred_url(&self, support_zip: bool) -> Option<&str> {
+        if support_zip {
+            self.config_file_v2
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    self.config_file
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty())
+                })
+        } else {
+            self.config_file
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    self.config_file_v2
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty())
+                })
+        }
+    }
+
+    pub fn preferred_hash(&self, support_zip: bool) -> Option<&str> {
+        if support_zip {
+            self.file_hash_v2
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    self.file_hash
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty())
+                })
+        } else {
+            self.file_hash
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    self.file_hash_v2
+                        .as_deref()
+                        .filter(|value| !value.trim().is_empty())
+                })
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MiWatchfaceDownloadResult {
+    #[serde(default)]
+    pub license: String,
+    #[serde(default)]
+    pub sign: String,
+    pub download_info: MiWatchfaceDownloadInfo,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MiWatchfaceLicensePayload {
+    #[serde(default)]
+    pub sign_time: i64,
+    #[serde(default)]
+    pub secret_id: String,
+    #[serde(default)]
+    pub trial_duration: Option<i64>,
+    #[serde(default)]
+    pub encrypt_type: i64,
+    #[serde(default)]
+    pub wf_hash: String,
+    #[serde(default)]
+    pub wf_id: String,
+}
+
+impl MiWatchfaceDownloadResult {
+    pub fn trial_duration(&self) -> Option<i64> {
+        serde_json::from_str::<MiWatchfaceLicensePayload>(&self.license)
+            .ok()
+            .and_then(|value| value.trial_duration)
+    }
+}
+
 /// Remove Xiaomi’s magic prefix from JSON payloads.
 fn strip_prefix(contents: &str) -> &str {
     const PREFIX: &str = "&&&START&&&";
@@ -314,6 +521,16 @@ fn parse_response_message(value: &serde_json::Value) -> String {
         }
     }
     String::new()
+}
+
+fn truncate_response_body(body: &str) -> String {
+    const MAX_CHARS: usize = 400;
+    let body = body.trim();
+    if body.chars().count() <= MAX_CHARS {
+        return body.to_string();
+    }
+    let truncated = body.chars().take(MAX_CHARS).collect::<String>();
+    format!("{truncated}...")
 }
 
 fn insert_cookie_header(store: &mut CookieStore, url: &Url, cookie_header: &str) -> Result<()> {
@@ -865,6 +1082,123 @@ pub async fn fetch_mi_latest_version(
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
     serde_json::from_value(result).map_err(|err| anyhow!("decode mi latest version failed: {err}"))
+}
+
+async fn fetch_mi_watchface_result<T: DeserializeOwned>(
+    token: MiAccountToken,
+    endpoint: &str,
+    data: serde_json::Value,
+    ua: String,
+) -> Result<T> {
+    let mut signed_form = HashMap::new();
+    signed_form.insert("data".to_string(), data.to_string());
+
+    let body = mi_service_call_encrypted_internal(
+        token,
+        "".to_string(),
+        format!("https://watch.iot.mi.com/ops/v1/{endpoint}"),
+        signed_form,
+        HashMap::new(),
+        HashMap::new(),
+        ua,
+        None,
+    )
+    .await
+    .with_context(|| format!("request mi watchface `{endpoint}` failed"))?;
+
+    let payload: serde_json::Value = serde_json::from_str(&body).with_context(|| {
+        format!(
+            "decode mi watchface `{endpoint}` payload failed, body={}",
+            truncate_response_body(&body)
+        )
+    })?;
+    let code = parse_response_code(&payload);
+    if code != 0 && code != 200 {
+        return Err(anyhow!(
+            "fetch mi watchface `{endpoint}` failed: code={}, msg={}, body={}",
+            code,
+            parse_response_message(&payload),
+            truncate_response_body(&body)
+        ));
+    }
+
+    let result = payload
+        .get("result")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    serde_json::from_value(result).map_err(|err| {
+        anyhow!(
+            "decode mi watchface `{endpoint}` result failed: {err}, body={}",
+            truncate_response_body(&body)
+        )
+    })
+}
+
+pub async fn fetch_mi_watchface_index(
+    token: MiAccountToken,
+    model: String,
+    firmware_version: Option<String>,
+    page: Option<u32>,
+    size: Option<u32>,
+    ua: String,
+) -> Result<MiWatchfaceIndexResult> {
+    fetch_mi_watchface_result(
+        token,
+        "paidwatchface/index",
+        serde_json::json!({
+            "model": model,
+            "firmware_version": firmware_version,
+            "page": page,
+            "size": size,
+        }),
+        ua,
+    )
+    .await
+}
+
+pub async fn fetch_mi_watchface_detail(
+    token: MiAccountToken,
+    model: String,
+    id: String,
+    firmware_version: String,
+    ua: String,
+) -> Result<MiWatchfaceDetailResult> {
+    fetch_mi_watchface_result(
+        token,
+        "paidwatchface/detail",
+        serde_json::json!({
+            "model": model,
+            "id": id,
+            "firmware_version": firmware_version,
+            "ids": [],
+        }),
+        ua,
+    )
+    .await
+}
+
+pub async fn fetch_mi_watchface_download(
+    token: MiAccountToken,
+    did: String,
+    model: String,
+    id: String,
+    is_trial: bool,
+    album_child_id: Option<String>,
+    ua: String,
+) -> Result<MiWatchfaceDownloadResult> {
+    fetch_mi_watchface_result(
+        token,
+        "paidwatchface/download",
+        serde_json::json!({
+            "did": did,
+            "model": model,
+            "id": id,
+            "is_trial": is_trial,
+            "album_child_id": album_child_id,
+        }),
+        ua,
+    )
+    .await
 }
 
 pub async fn report_mi_device_info(
