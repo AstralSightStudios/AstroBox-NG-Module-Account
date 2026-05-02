@@ -8,11 +8,11 @@ use aes::Aes128;
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose;
-use cbc::cipher::{BlockModeDecrypt, BlockModeEncrypt, KeyIvInit, block_padding::Pkcs7};
+use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
 use cipher::StreamCipher;
 use md5::Md5;
-use rand::RngExt;
-use rc4::{KeyInit, Rc4};
+use rand::{Rng, distributions::Uniform, rngs::OsRng};
+use rc4::{KeyInit, Rc4, consts::U32};
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest_cookie_store::{CookieStore, CookieStoreMutex, RawCookie};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -412,7 +412,7 @@ fn strip_prefix(contents: &str) -> &str {
 /// Generate Mi nonce: 8 random bytes + 4-byte minutes since epoch (big-endian).
 fn generate_nonce(millis: u64) -> String {
     let mut rand_part = [0u8; 8];
-    rand::rng().fill(&mut rand_part);
+    OsRng.fill(&mut rand_part);
     let mut buf = Vec::with_capacity(12);
     buf.extend_from_slice(&rand_part);
     buf.extend_from_slice(&((millis / 60_000) as u32).to_be_bytes());
@@ -421,17 +421,16 @@ fn generate_nonce(millis: u64) -> String {
 
 /// 6-character lowercase device id.
 fn random_device_id() -> String {
-    let mut rng = rand::rng();
-    (0..6)
-        .map(|_| char::from(rng.random_range(b'a'..=b'z')))
-        .collect()
+    let range = Uniform::from(b'a'..=b'z');
+    OsRng.sample_iter(&range).take(6).map(char::from).collect()
 }
 
 fn random_request_id(len: usize) -> String {
     const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-    let mut rng = rand::rng();
-    (0..len)
-        .map(|_| rng.random_range(0..CHARSET.len()))
+    let range = Uniform::from(0..CHARSET.len());
+    OsRng
+        .sample_iter(&range)
+        .take(len)
         .map(|index| CHARSET[index] as char)
         .collect()
 }
@@ -457,7 +456,7 @@ fn aes_encrypt_base64(security: &str, value: &str) -> Result<String> {
     let mut buffer = vec![0u8; plain.len() + 16];
     buffer[..plain.len()].copy_from_slice(plain);
     let encrypted = cipher
-        .encrypt_padded::<Pkcs7>(&mut buffer, plain.len())
+        .encrypt_padded_mut::<Pkcs7>(&mut buffer, plain.len())
         .map_err(|err| anyhow!("encrypt account payload failed: {err}"))?;
     Ok(general_purpose::STANDARD.encode(encrypted))
 }
@@ -472,7 +471,7 @@ fn aes_decrypt_base64(security: &str, value: &str) -> Result<String> {
         .decode(value)
         .map_err(|err| anyhow!("decode encrypted account response failed: {err}"))?;
     let decrypted = cipher
-        .decrypt_padded::<Pkcs7>(&mut buffer)
+        .decrypt_padded_mut::<Pkcs7>(&mut buffer)
         .map_err(|err| anyhow!("decrypt account response failed: {err}"))?;
     String::from_utf8(decrypted.to_vec())
         .map_err(|err| anyhow!("decode account response as utf-8 failed: {err}"))
@@ -746,8 +745,8 @@ fn rc4_encrypt_params(
 ) -> Result<HashMap<String, String>> {
     // Build a cipher, drop first 1024 bytes.
     let key_bytes = general_purpose::STANDARD.decode(signed_nonce)?;
-    let mut cipher = Rc4::new_from_slice(&key_bytes)
-        .map_err(|err| anyhow!("init account rc4 encryptor failed: {err}"))?;
+    let key = rc4::Key::<U32>::from_slice(&key_bytes);
+    let mut cipher = Rc4::<U32>::new(key);
     let mut drop_buf = [0u8; 1024];
     cipher.apply_keystream(&mut drop_buf);
 
@@ -856,8 +855,8 @@ async fn mi_service_call_encrypted_internal(
     }
 
     let key_bytes = general_purpose::STANDARD.decode(&signed_nonce)?;
-    let mut cipher = Rc4::new_from_slice(&key_bytes)
-        .map_err(|err| anyhow!("init account rc4 decryptor failed: {err}"))?;
+    let key = rc4::Key::<U32>::from_slice(&key_bytes);
+    let mut cipher = Rc4::<U32>::new(key);
     let mut drop_buf = [0u8; 1024];
     cipher.apply_keystream(&mut drop_buf);
 
@@ -994,11 +993,10 @@ pub async fn fetch_mi_user_core_info(
 
     if let Some(addresses) = data.get("userAddresses").and_then(|value| value.as_array()) {
         for address in addresses {
-            let Some(address_type) = address.get("addressType").and_then(|value| {
-                value
-                    .as_i64()
-                    .or_else(|| value.as_str()?.parse::<i64>().ok())
-            }) else {
+            let Some(address_type) = address
+                .get("addressType")
+                .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse::<i64>().ok()))
+            else {
                 continue;
             };
             let Some(raw_address) = address.get("address").and_then(|value| value.as_str()) else {
@@ -1006,11 +1004,7 @@ pub async fn fetch_mi_user_core_info(
             };
             let flags = address
                 .get("flags")
-                .and_then(|value| {
-                    value
-                        .as_i64()
-                        .or_else(|| value.as_str()?.parse::<i64>().ok())
-                })
+                .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse::<i64>().ok()))
                 .unwrap_or(0);
             let is_primary = (flags & 2) != 0;
 
@@ -1408,12 +1402,7 @@ pub async fn login_mi_account_with_options(
     // --- Step 2: serviceLoginAuth2 ---
     let mut md5 = Md5::default();
     md5.update(password.as_bytes());
-    let pwd_hash = md5
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>()
-        .to_uppercase();
+    let pwd_hash = format!("{:x}", md5.finalize()).to_uppercase();
 
     let mut fields = HashMap::<&str, &str>::new();
     fields.insert("sid", "miothealth");
