@@ -993,10 +993,11 @@ pub async fn fetch_mi_user_core_info(
 
     if let Some(addresses) = data.get("userAddresses").and_then(|value| value.as_array()) {
         for address in addresses {
-            let Some(address_type) = address
-                .get("addressType")
-                .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse::<i64>().ok()))
-            else {
+            let Some(address_type) = address.get("addressType").and_then(|value| {
+                value
+                    .as_i64()
+                    .or_else(|| value.as_str()?.parse::<i64>().ok())
+            }) else {
                 continue;
             };
             let Some(raw_address) = address.get("address").and_then(|value| value.as_str()) else {
@@ -1004,7 +1005,11 @@ pub async fn fetch_mi_user_core_info(
             };
             let flags = address
                 .get("flags")
-                .and_then(|value| value.as_i64().or_else(|| value.as_str()?.parse::<i64>().ok()))
+                .and_then(|value| {
+                    value
+                        .as_i64()
+                        .or_else(|| value.as_str()?.parse::<i64>().ok())
+                })
                 .unwrap_or(0);
             let is_primary = (flags & 2) != 0;
 
