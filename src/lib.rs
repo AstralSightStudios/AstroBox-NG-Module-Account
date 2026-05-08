@@ -1,6 +1,7 @@
 pub mod models;
 pub mod net;
 pub mod storage;
+pub mod vivo;
 pub mod xiaomi;
 
 use crate::models::AccountRecord;
