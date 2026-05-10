@@ -252,12 +252,7 @@ pub async fn fetch_vivo_latest_version(
         .build()?;
 
     let version_code = vercode_from_vivo_version(&firmware_version);
-    let mac_address = query.mac_address.trim();
-    let mac_address = if mac_address.is_empty() {
-        "00:00:00:00:00:00"
-    } else {
-        mac_address
-    };
+    let mac_address = normalize_vivo_mac_address(&query.mac_address);
     let client_id = query.client_id.trim();
     let client_id = if client_id.is_empty() {
         "AstroBox"
@@ -271,7 +266,7 @@ pub async fn fetch_vivo_latest_version(
         &device,
         version_code,
         client_id,
-        mac_address,
+        &mac_address,
         query.version_type,
         &locale,
         false,
@@ -286,7 +281,7 @@ pub async fn fetch_vivo_latest_version(
         &device,
         version_code,
         client_id,
-        mac_address,
+        &mac_address,
         query.version_type,
         &locale,
         true,
@@ -597,6 +592,28 @@ pub fn vivo_hard_version(version: &str) -> String {
     parts[..2].join("_")
 }
 
+pub fn vivo_ota_device_from_request(requested_device: &str, firmware_version: &str) -> String {
+    let requested_device = requested_device.trim();
+    let hard_version = vivo_hard_version(firmware_version);
+    if hard_version.trim().is_empty() {
+        return requested_device.to_string();
+    }
+    if requested_device.is_empty() || !is_probably_vivo_ota_device(requested_device) {
+        return hard_version;
+    }
+    requested_device.to_string()
+}
+
+fn is_probably_vivo_ota_device(device: &str) -> bool {
+    let device = device.trim();
+    if device.is_empty() || device.chars().any(char::is_whitespace) {
+        return false;
+    }
+
+    let upper = device.to_ascii_uppercase();
+    upper.starts_with("DPD") || upper.starts_with("PD") || upper.starts_with("IQOO")
+}
+
 pub fn format_vivo_version_name(version: &str) -> String {
     let version = version.trim();
     if version.len() < 3 {
@@ -651,6 +668,29 @@ fn normalize_vivo_locale(locale: &str) -> String {
         "en" => "en_US".to_string(),
         value => value.to_string(),
     }
+}
+
+fn normalize_vivo_mac_address(mac_address: &str) -> String {
+    let mac_address = mac_address.trim();
+    if mac_address.is_empty() {
+        return "00:00:00:00:00:00".to_string();
+    }
+
+    let hex: String = mac_address
+        .chars()
+        .filter(|ch| ch.is_ascii_hexdigit())
+        .map(|ch| ch.to_ascii_uppercase())
+        .collect();
+    if hex.len() == 12 {
+        return hex
+            .as_bytes()
+            .chunks(2)
+            .map(|chunk| std::str::from_utf8(chunk).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(":");
+    }
+
+    mac_address.to_ascii_uppercase()
 }
 
 #[cfg(test)]
@@ -723,5 +763,29 @@ mod tests {
         assert_eq!(vivo_os_version("DPD2468_A_1.40.9_extra"), "1.40.9");
         assert_eq!(vivo_hard_version("DPD2508AB_A_1.0.0"), "DPD2508AB_A");
         assert_eq!(vivo_os_version("DPD2508AB_A_1.0.0"), "1.0.0");
+    }
+
+    #[test]
+    fn vivo_ota_device_falls_back_to_hard_version_for_marketing_model() {
+        assert_eq!(
+            vivo_ota_device_from_request("vivo WATCH GT2", "DPD2508AB_A_1.0.0"),
+            "DPD2508AB_A"
+        );
+        assert_eq!(
+            vivo_ota_device_from_request("DPD2508AB_A", "DPD2508AB_A_1.0.0"),
+            "DPD2508AB_A"
+        );
+    }
+
+    #[test]
+    fn vivo_mac_address_matches_android_uppercase_style() {
+        assert_eq!(
+            normalize_vivo_mac_address("aa-bb-cc-dd-ee-ff"),
+            "AA:BB:CC:DD:EE:FF"
+        );
+        assert_eq!(
+            normalize_vivo_mac_address("aabbccddeeff"),
+            "AA:BB:CC:DD:EE:FF"
+        );
     }
 }
