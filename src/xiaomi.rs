@@ -65,6 +65,11 @@ pub struct ServiceLoginRespone {
     pub sign: String,
 }
 
+enum ServiceLoginSession {
+    NeedCredential { sign: String },
+    Authenticated(ServiceLoginAuthRespone),
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct DeviceDetail {
     #[serde(default)]
@@ -120,6 +125,10 @@ pub struct MiAccountToken {
     pub ssecurity: String,
     pub service_token: String,
     pub c_user_id: String,
+    #[serde(default)]
+    pub pass_token: String,
+    #[serde(default)]
+    pub psecurity: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -698,6 +707,31 @@ fn seed_xiaomi_login_cookies(
     }
 
     Ok(())
+}
+
+fn parse_service_login_session(
+    body: &str,
+    headers: &HeaderMap,
+    context: &str,
+) -> Result<ServiceLoginSession> {
+    let sign_resp: ServiceLoginRespone =
+        serde_json::from_str(body).with_context(|| format!("{context} sign parse failed"))?;
+    if !sign_resp.sign.is_empty() {
+        return Ok(ServiceLoginSession::NeedCredential {
+            sign: sign_resp.sign,
+        });
+    }
+
+    let auth_resp: ServiceLoginAuthRespone = serde_json::from_str(body).map_err(|err| {
+        anyhow!(
+            "{context} returned payload without _sign and failed to parse authenticated session: {}; body={}",
+            err,
+            body
+        )
+    })?;
+    Ok(ServiceLoginSession::Authenticated(
+        fill_auth_response_from_headers(auth_resp, headers),
+    ))
 }
 
 /// SHA-256( ssecurity_b64_dec + nonce_b64_dec ) → Base64.
@@ -1346,7 +1380,7 @@ pub async fn login_mi_account_with_options(
         sdk_version,
         &device_id,
         cookie_header.as_deref(),
-        Some(&username),
+        None,
     )?;
 
     // --- Step 1: get _sign ---
@@ -1362,8 +1396,32 @@ pub async fn login_mi_account_with_options(
         return Err(anyhow!("serviceLogin failed: {}", step1.status()));
     }
     let step1_body = strip_prefix(&step1.text().await?).to_string();
-    let sign_resp: ServiceLoginRespone = serde_json::from_str(&step1_body)?;
-    let sign = sign_resp.sign;
+    let service_login = parse_service_login_session(&step1_body, &step1_headers, "serviceLogin")?;
+    let sign = match service_login {
+        ServiceLoginSession::NeedCredential { sign } => sign,
+        ServiceLoginSession::Authenticated(auth_resp) => {
+            log::info!(
+                "[MiAccount.Login] serviceLogin returned authenticated session directly code={} description={} notification_url={:?} device_id={} ssecurity_present={} c_user_id_present={} nonce={}",
+                auth_resp.code,
+                auth_resp.description,
+                auth_resp.notification_url,
+                device_id,
+                !auth_resp.ssecurity.trim().is_empty(),
+                !auth_resp.c_user_id.trim().is_empty(),
+                auth_resp.nonce
+            );
+
+            return finish_login_with_auth_response(
+                &client,
+                &cookie_store,
+                auth_resp,
+                ua,
+                &username,
+                &device_id,
+            )
+            .await;
+        }
+    };
 
     log::info!(
         "[MiAccount.Login] serviceLogin succeeded for username={} device_id={} sign_present={}",
@@ -1371,38 +1429,6 @@ pub async fn login_mi_account_with_options(
         device_id,
         !sign.is_empty()
     );
-
-    if sign.is_empty() {
-        let auth_resp: ServiceLoginAuthRespone = serde_json::from_str(&step1_body).map_err(|err| {
-            anyhow!(
-                "serviceLogin returned payload without _sign and failed to parse authenticated session: {}; body={}",
-                err,
-                step1_body
-            )
-        })?;
-        let auth_resp = fill_auth_response_from_headers(auth_resp, &step1_headers);
-
-        log::info!(
-            "[MiAccount.Login] serviceLogin returned authenticated session directly code={} description={} notification_url={:?} device_id={} ssecurity_present={} c_user_id_present={} nonce={}",
-            auth_resp.code,
-            auth_resp.description,
-            auth_resp.notification_url,
-            device_id,
-            !auth_resp.ssecurity.trim().is_empty(),
-            !auth_resp.c_user_id.trim().is_empty(),
-            auth_resp.nonce
-        );
-
-        return finish_login_with_auth_response(
-            &client,
-            &cookie_store,
-            auth_resp,
-            ua,
-            &username,
-            &device_id,
-        )
-        .await;
-    }
 
     // --- Step 2: serviceLoginAuth2 ---
     let mut md5 = Md5::default();
@@ -1430,9 +1456,17 @@ pub async fn login_mi_account_with_options(
         return Err(anyhow!("serviceLoginAuth2 failed: {}", step2.status()));
     }
 
-    let auth_resp: ServiceLoginAuthRespone =
-        serde_json::from_str(strip_prefix(&step2.text().await?))?;
-    let auth_resp = fill_auth_response_from_headers(auth_resp, &step2_headers);
+    let step2_body = strip_prefix(&step2.text().await?).to_string();
+    let auth_resp =
+        match parse_service_login_session(&step2_body, &step2_headers, "serviceLoginAuth2")? {
+            ServiceLoginSession::Authenticated(auth_resp) => auth_resp,
+            ServiceLoginSession::NeedCredential { .. } => {
+                return Err(anyhow!(
+                    "serviceLoginAuth2 returned credential challenge again; body={}",
+                    step2_body
+                ));
+            }
+        };
 
     log::info!(
         "[MiAccount.Login] serviceLoginAuth2 code={} description={} notification_url={:?} device_id={} ssecurity_present={} c_user_id_present={} nonce={}",
@@ -1447,6 +1481,118 @@ pub async fn login_mi_account_with_options(
 
     finish_login_with_auth_response(&client, &cookie_store, auth_resp, ua, &username, &device_id)
         .await
+}
+
+/// Refresh `serviceToken` with the long-lived Xiaomi `passToken`.
+///
+/// This mirrors Xiaomi's account SDK flow: call `serviceLogin` with
+/// `userId/passToken/deviceId` cookies, then follow the returned STS URL to
+/// obtain a fresh service token for `miothealth`.
+pub async fn refresh_mi_account_token(token: MiAccountToken, ua: String) -> Result<MiAccountToken> {
+    let user_id = token.user_id.trim();
+    if user_id.is_empty() {
+        return Err(anyhow!("cannot refresh Xiaomi token without userId"));
+    }
+    if token.pass_token.trim().is_empty() {
+        return Err(anyhow!(
+            "cannot refresh Xiaomi token because saved passToken is missing"
+        ));
+    }
+
+    let device_id = if token.device_id.trim().is_empty() {
+        random_device_id()
+    } else {
+        token.device_id.clone()
+    };
+    let sdk_version = "accountsdk-18.8.15";
+    let mut cookie_parts = vec![
+        format!("userId={}", token.user_id),
+        format!("passToken={}", token.pass_token),
+        format!("deviceId={device_id}"),
+    ];
+    if !token.c_user_id.trim().is_empty() {
+        cookie_parts.push(format!("cUserId={}", token.c_user_id));
+    }
+    let cookie_header = cookie_parts.join("; ");
+
+    log::info!(
+        "[MiAccount.Refresh] begin service token refresh user_id={} device_id={}",
+        user_id,
+        device_id
+    );
+
+    let cookie_store = Arc::new(CookieStoreMutex::new(CookieStore::default()));
+    let client = crate::net::default_client_builder()
+        .cookie_provider(cookie_store.clone())
+        .build()?;
+    seed_xiaomi_login_cookies(
+        &cookie_store,
+        sdk_version,
+        &device_id,
+        Some(cookie_header.as_str()),
+        Some(user_id),
+    )?;
+
+    let step1 = client
+        .get("https://account.xiaomi.com/pass/serviceLogin?sid=miothealth&_json=true")
+        .header("User-Agent", ua.clone())
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .send()
+        .await?;
+    let step1_headers = step1.headers().clone();
+
+    if step1.status() != 200 {
+        return Err(anyhow!(
+            "Xiaomi token refresh serviceLogin failed: {}",
+            step1.status()
+        ));
+    }
+
+    let step1_body = strip_prefix(&step1.text().await?).to_string();
+    let auth_resp =
+        match parse_service_login_session(&step1_body, &step1_headers, "Xiaomi token refresh")? {
+            ServiceLoginSession::Authenticated(auth_resp) => auth_resp,
+            ServiceLoginSession::NeedCredential { .. } => {
+                return Err(anyhow!(
+                    "saved Xiaomi passToken is no longer accepted; credential login is required"
+                ));
+            }
+        };
+    if auth_resp.user_id != 0 && auth_resp.user_id.to_string() != user_id {
+        return Err(anyhow!(
+            "Xiaomi token refresh returned mismatched userId: expected {}, got {}",
+            user_id,
+            auth_resp.user_id
+        ));
+    }
+
+    let mut refreshed =
+        finish_login_with_auth_response(&client, &cookie_store, auth_resp, ua, user_id, &device_id)
+            .await?;
+    if refreshed.user_id.trim().is_empty() {
+        refreshed.user_id = user_id.to_string();
+    }
+    if refreshed.device_id.trim().is_empty() {
+        refreshed.device_id = device_id;
+    }
+    if refreshed.c_user_id.trim().is_empty() {
+        refreshed.c_user_id = token.c_user_id;
+    }
+    if refreshed.pass_token.trim().is_empty() {
+        refreshed.pass_token = token.pass_token;
+    }
+    if refreshed.psecurity.trim().is_empty() {
+        refreshed.psecurity = token.psecurity;
+    }
+
+    log::info!(
+        "[MiAccount.Refresh] service token refreshed user_id={} device_id={} service_token_len={}",
+        refreshed.user_id,
+        refreshed.device_id,
+        refreshed.service_token.len()
+    );
+
+    Ok(refreshed)
 }
 
 pub async fn fetch_2fa_session_with_cookie(
@@ -1506,25 +1652,19 @@ pub async fn fetch_2fa_session_with_cookie(
     }
 
     let step1_body = strip_prefix(&step1.text().await?).to_string();
-    let sign_resp: ServiceLoginRespone = serde_json::from_str(&step1_body)?;
-    if !sign_resp.sign.is_empty() {
-        log::warn!(
-            "[MiAccount.Login] verified 2FA cookie still returned _sign device_id={}",
-            device_id
-        );
-        return Err(anyhow!(
-            "verified 2FA cookie session still requires credential step"
-        ));
-    }
-
-    let auth_resp: ServiceLoginAuthRespone = serde_json::from_str(&step1_body).map_err(|err| {
-        anyhow!(
-            "verified 2FA session parse failed: {}; body={}",
-            err,
-            step1_body
-        )
-    })?;
-    let auth_resp = fill_auth_response_from_headers(auth_resp, &step1_headers);
+    let auth_resp =
+        match parse_service_login_session(&step1_body, &step1_headers, "verified 2FA session")? {
+            ServiceLoginSession::Authenticated(auth_resp) => auth_resp,
+            ServiceLoginSession::NeedCredential { .. } => {
+                log::warn!(
+                    "[MiAccount.Login] verified 2FA cookie still returned _sign device_id={}",
+                    device_id
+                );
+                return Err(anyhow!(
+                    "verified 2FA cookie session still requires credential step"
+                ));
+            }
+        };
 
     log::info!(
         "[MiAccount.Login] fetched verified 2FA session code={} ssecurity_present={} notification_url={:?} device_id={}",
@@ -1635,10 +1775,6 @@ pub async fn complete_2fa_login_with_sts_url(
     }
 
     let client_sign = generate_client_sign(nonce, &ssecurity);
-    let user_id = cookie_header
-        .as_deref()
-        .and_then(|cookie_header| extract_cookie_value(cookie_header, "userId"))
-        .unwrap_or_default();
     let device_id = cookie_header
         .as_deref()
         .and_then(|cookie_header| extract_cookie_value(cookie_header, "deviceId"))
@@ -1685,19 +1821,27 @@ pub async fn complete_2fa_login_with_sts_url(
     let service_token = extract_header_value(&headers, "serviceToken")
         .or_else(|| extract_header_by_suffix(&headers, "_serviceToken"))
         .ok_or_else(|| anyhow!("serviceToken header missing after sts finalize"))?;
+    let response_user_id = extract_header_value(&headers, "userId");
+    let response_c_user_id = extract_header_value(&headers, "cUserId");
 
     log::info!(
-        "[MiAccount.Login] 2FA sts url finalized service_token_len={} c_user_id={}",
+        "[MiAccount.Login] 2FA sts url finalized service_token_len={} user_id={:?} c_user_id={}",
         service_token.len(),
+        response_user_id,
         c_user_id
     );
 
     Ok(MiAccountToken {
-        user_id,
+        user_id: response_user_id.unwrap_or_default(),
         device_id,
         ssecurity,
         service_token,
-        c_user_id,
+        c_user_id: response_c_user_id.unwrap_or(c_user_id),
+        pass_token: cookie_header
+            .as_deref()
+            .and_then(|cookie_header| extract_cookie_value(cookie_header, "passToken"))
+            .unwrap_or_default(),
+        psecurity: String::new(),
     })
 }
 
@@ -1775,11 +1919,13 @@ pub async fn complete_2fa_login_with_cookie(
     );
 
     Ok(MiAccountToken {
-        user_id: extract_cookie_value(&cookie_header, "userId").unwrap_or_default(),
+        user_id: String::new(),
         device_id,
         ssecurity,
         service_token,
         c_user_id,
+        pass_token: extract_cookie_value(&cookie_header, "passToken").unwrap_or_default(),
+        psecurity: String::new(),
     })
 }
 
@@ -1817,8 +1963,9 @@ async fn finish_login_with_auth_response(
             url
         );
         return Err(anyhow!(
-            "2-f-a={}\ndevice-id={}\nssecurity={}\nc-user-id={}\nlocation={}\nnonce={}\npsecurity={}\npass-token={}",
+            "2-f-a={}\nuser-id={}\ndevice-id={}\nssecurity={}\nc-user-id={}\nlocation={}\nnonce={}\npsecurity={}\npass-token={}",
             url,
+            auth_resp.user_id,
             device_id,
             auth_resp.ssecurity,
             auth_resp.c_user_id,
@@ -1855,10 +2002,14 @@ async fn finish_login_with_auth_response(
     );
 
     Ok(MiAccountToken {
-        user_id: auth_resp.user_id.to_string(),
+        user_id: (auth_resp.user_id != 0)
+            .then(|| auth_resp.user_id.to_string())
+            .unwrap_or_default(),
         device_id: device_id.to_string(),
         ssecurity: auth_resp.ssecurity,
         service_token,
         c_user_id: auth_resp.c_user_id,
+        pass_token: auth_resp.pass_token,
+        psecurity: auth_resp.psecurity,
     })
 }
