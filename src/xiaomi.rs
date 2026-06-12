@@ -24,6 +24,10 @@ type Aes128CbcEncryptor = cbc::Encryptor<Aes128>;
 type Aes128CbcDecryptor = cbc::Decryptor<Aes128>;
 
 const ACCOUNT_AES_IV: &[u8; 16] = b"0102030405060708";
+const XIAOMI_ACCOUNT_SDK_VERSION: &str = "accountsdk-18.8.15";
+const XIAOMI_HEALTH_SID: &str = "miothealth";
+const XIAOMI_PROFILE_SID: &str = "passportapi";
+const XIAOMI_CORE_INFO_URL: &str = "https://api.account.xiaomi.com/pass/v2/safe/user/coreInfo";
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ServiceLoginAuthRespone {
@@ -573,6 +577,25 @@ fn extract_cookie_value(cookie_header: &str, name: &str) -> Option<String> {
     })
 }
 
+fn extract_cookie_store_value_for_url(
+    cookie_store: &Arc<CookieStoreMutex>,
+    url: &Url,
+    names: &[String],
+) -> Option<String> {
+    let store = cookie_store.lock().unwrap();
+    for (name, value) in store.get_request_values(url) {
+        if names.iter().any(|candidate| candidate == name) && !value.trim().is_empty() {
+            return Some(value.trim().to_string());
+        }
+    }
+
+    store.iter_unexpired().find_map(|cookie| {
+        let (name, value) = cookie.name_value();
+        (names.iter().any(|candidate| candidate == name) && !value.trim().is_empty())
+            .then(|| value.trim().to_string())
+    })
+}
+
 fn non_empty_str(value: &str) -> Option<&str> {
     let trimmed = value.trim();
     (!trimmed.is_empty()).then_some(trimmed)
@@ -595,6 +618,32 @@ fn extract_header_by_suffix(headers: &HeaderMap, suffix: &str) -> Option<String>
             .flatten()
             .map(ToOwned::to_owned)
     })
+}
+
+fn extract_sts_cookie_value(
+    headers: &HeaderMap,
+    cookie_store: &Arc<CookieStoreMutex>,
+    final_url: &Url,
+    sid: &str,
+    name: &str,
+) -> Option<String> {
+    let mut names = vec![name.to_string()];
+    if name == "serviceToken" {
+        names.push(format!("{sid}_serviceToken"));
+    }
+
+    for candidate in &names {
+        if let Some(value) = extract_header_value(headers, candidate) {
+            return Some(value);
+        }
+    }
+    if name == "serviceToken" {
+        if let Some(value) = extract_header_by_suffix(headers, "_serviceToken") {
+            return Some(value);
+        }
+    }
+
+    extract_cookie_store_value_for_url(cookie_store, final_url, &names)
 }
 
 fn fill_auth_response_from_headers(
@@ -852,7 +901,7 @@ async fn mi_service_call_encrypted_internal(
     headers.insert("HandleParams", HeaderValue::from_static("true"));
 
     let mut cookie_parts = vec![
-        "sdkVersion=accountsdk-18.8.15".to_string(),
+        format!("sdkVersion={XIAOMI_ACCOUNT_SDK_VERSION}"),
         format!(
             "locale={}",
             cookie_locale
@@ -921,17 +970,19 @@ pub async fn mi_service_call_encrypted(
     .await
 }
 
-pub async fn fetch_mi_user_core_info(
+async fn request_mi_user_core_info_with_token(
     token: MiAccountToken,
-    locale: Option<String>,
+    locale: String,
+    sid: Option<&str>,
+    flags: &str,
 ) -> Result<MiUserCoreInfo> {
-    let locale = locale
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "en_US".to_string());
     let mut params = HashMap::new();
     params.insert("userId".to_string(), token.user_id.clone());
     params.insert("transId".to_string(), random_request_id(15));
-    params.insert("flags".to_string(), "11".to_string());
+    params.insert("flags".to_string(), flags.to_string());
+    if let Some(sid) = sid.filter(|value| !value.trim().is_empty()) {
+        params.insert("sid".to_string(), sid.to_string());
+    }
 
     let mut encrypted_params = HashMap::new();
     for (key, value) in params {
@@ -939,7 +990,7 @@ pub async fn fetch_mi_user_core_info(
     }
     let signature = generate_account_signature(
         "GET",
-        "https://api.account.xiaomi.com/pass/v2/safe/user/coreInfo",
+        XIAOMI_CORE_INFO_URL,
         &encrypted_params,
         &token.ssecurity,
     )?;
@@ -960,7 +1011,7 @@ pub async fn fetch_mi_user_core_info(
 
     let response = crate::net::default_client_builder()
         .build()?
-        .get("https://api.account.xiaomi.com/pass/v2/safe/user/coreInfo")
+        .get(XIAOMI_CORE_INFO_URL)
         .header("Cookie", cookie_parts.join("; "))
         .query(&encrypted_params)
         .send()
@@ -1004,11 +1055,14 @@ pub async fn fetch_mi_user_core_info(
             .to_string(),
         nick_name: data
             .get("nickName")
+            .or_else(|| data.get("nickname"))
             .and_then(|value| value.as_str())
             .unwrap_or_default()
             .to_string(),
         avatar_address: data
             .get("icon")
+            .or_else(|| data.get("avatarAddress"))
+            .or_else(|| data.get("avatar"))
             .and_then(|value| value.as_str())
             .map(append_avatar_size_suffix)
             .unwrap_or_default(),
@@ -1066,6 +1120,78 @@ pub async fn fetch_mi_user_core_info(
     }
 
     Ok(profile)
+}
+
+pub async fn fetch_mi_user_core_info(
+    token: MiAccountToken,
+    locale: Option<String>,
+) -> Result<MiUserCoreInfo> {
+    fetch_mi_user_core_info_with_user_agent(token, locale, None).await
+}
+
+pub async fn fetch_mi_user_core_info_with_user_agent(
+    token: MiAccountToken,
+    locale: Option<String>,
+    ua: Option<String>,
+) -> Result<MiUserCoreInfo> {
+    let locale = locale
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "en_US".to_string());
+    let mut last_error = None;
+
+    if !token.pass_token.trim().is_empty() {
+        if let Some(ua) = ua.as_deref().filter(|value| !value.trim().is_empty()) {
+            match refresh_mi_account_token_for_sid(
+                token.clone(),
+                ua.to_string(),
+                XIAOMI_PROFILE_SID,
+            )
+            .await
+            {
+                Ok(profile_token) => {
+                    match request_mi_user_core_info_with_token(
+                        profile_token,
+                        locale.clone(),
+                        Some(XIAOMI_PROFILE_SID),
+                        "9",
+                    )
+                    .await
+                    {
+                        Ok(profile) => return Ok(profile),
+                        Err(err) => {
+                            log::warn!(
+                                "[MiAccount.Profile] passportapi core info request failed: {}",
+                                err
+                            );
+                            last_error = Some(err);
+                        }
+                    }
+                }
+                Err(err) => {
+                    log::warn!(
+                        "[MiAccount.Profile] failed to obtain passportapi service token: {}",
+                        err
+                    );
+                    last_error = Some(err);
+                }
+            }
+        }
+    }
+
+    match request_mi_user_core_info_with_token(token, locale, None, "11").await {
+        Ok(profile) => Ok(profile),
+        Err(err) => {
+            if let Some(passport_error) = last_error {
+                Err(anyhow!(
+                    "fetch mi user core info failed with passportapi: {}; fallback failed: {}",
+                    passport_error,
+                    err
+                ))
+            } else {
+                Err(err)
+            }
+        }
+    }
 }
 
 pub async fn fetch_mi_latest_version(
@@ -1356,7 +1482,7 @@ pub async fn login_mi_account_with_options(
     let device_id = device_id
         .or(cookie_device_id)
         .unwrap_or_else(random_device_id);
-    let sdk_version = "accountsdk-18.8.15";
+    let sdk_version = XIAOMI_ACCOUNT_SDK_VERSION;
 
     log::info!(
         "[MiAccount.Login] begin username={} device_id={} retry_with_cookie={}",
@@ -1385,7 +1511,9 @@ pub async fn login_mi_account_with_options(
 
     // --- Step 1: get _sign ---
     let step1 = client
-        .get("https://account.xiaomi.com/pass/serviceLogin?sid=miothealth&_json=true")
+        .get(format!(
+            "https://account.xiaomi.com/pass/serviceLogin?sid={XIAOMI_HEALTH_SID}&_json=true"
+        ))
         .header("User-Agent", ua.clone())
         .header("Content-Type", "application/x-www-form-urlencoded")
         .send()
@@ -1436,7 +1564,7 @@ pub async fn login_mi_account_with_options(
     let pwd_hash = format!("{:x}", md5.finalize()).to_uppercase();
 
     let mut fields = HashMap::<&str, &str>::new();
-    fields.insert("sid", "miothealth");
+    fields.insert("sid", XIAOMI_HEALTH_SID);
     fields.insert("hash", &pwd_hash);
     fields.insert("callback", "https://sts-hlth.io.mi.com/healthapp/sts");
     fields.insert("qs", "%3Fsid%3Dmiothealth%26_json%3Dtrue");
@@ -1489,6 +1617,14 @@ pub async fn login_mi_account_with_options(
 /// `userId/passToken/deviceId` cookies, then follow the returned STS URL to
 /// obtain a fresh service token for `miothealth`.
 pub async fn refresh_mi_account_token(token: MiAccountToken, ua: String) -> Result<MiAccountToken> {
+    refresh_mi_account_token_for_sid(token, ua, XIAOMI_HEALTH_SID).await
+}
+
+async fn refresh_mi_account_token_for_sid(
+    token: MiAccountToken,
+    ua: String,
+    sid: &str,
+) -> Result<MiAccountToken> {
     let user_id = token.user_id.trim();
     if user_id.is_empty() {
         return Err(anyhow!("cannot refresh Xiaomi token without userId"));
@@ -1504,7 +1640,6 @@ pub async fn refresh_mi_account_token(token: MiAccountToken, ua: String) -> Resu
     } else {
         token.device_id.clone()
     };
-    let sdk_version = "accountsdk-18.8.15";
     let mut cookie_parts = vec![
         format!("userId={}", token.user_id),
         format!("passToken={}", token.pass_token),
@@ -1516,7 +1651,8 @@ pub async fn refresh_mi_account_token(token: MiAccountToken, ua: String) -> Resu
     let cookie_header = cookie_parts.join("; ");
 
     log::info!(
-        "[MiAccount.Refresh] begin service token refresh user_id={} device_id={}",
+        "[MiAccount.Refresh] begin service token refresh sid={} user_id={} device_id={}",
+        sid,
         user_id,
         device_id
     );
@@ -1527,14 +1663,16 @@ pub async fn refresh_mi_account_token(token: MiAccountToken, ua: String) -> Resu
         .build()?;
     seed_xiaomi_login_cookies(
         &cookie_store,
-        sdk_version,
+        XIAOMI_ACCOUNT_SDK_VERSION,
         &device_id,
         Some(cookie_header.as_str()),
         Some(user_id),
     )?;
 
+    let service_login_url =
+        format!("https://account.xiaomi.com/pass/serviceLogin?sid={sid}&_json=true");
     let step1 = client
-        .get("https://account.xiaomi.com/pass/serviceLogin?sid=miothealth&_json=true")
+        .get(service_login_url)
         .header("User-Agent", ua.clone())
         .header("Content-Type", "application/x-www-form-urlencoded")
         .send()
@@ -1543,32 +1681,42 @@ pub async fn refresh_mi_account_token(token: MiAccountToken, ua: String) -> Resu
 
     if step1.status() != 200 {
         return Err(anyhow!(
-            "Xiaomi token refresh serviceLogin failed: {}",
+            "Xiaomi token refresh serviceLogin for {sid} failed: {}",
             step1.status()
         ));
     }
 
     let step1_body = strip_prefix(&step1.text().await?).to_string();
-    let auth_resp =
-        match parse_service_login_session(&step1_body, &step1_headers, "Xiaomi token refresh")? {
-            ServiceLoginSession::Authenticated(auth_resp) => auth_resp,
-            ServiceLoginSession::NeedCredential { .. } => {
-                return Err(anyhow!(
-                    "saved Xiaomi passToken is no longer accepted; credential login is required"
-                ));
-            }
-        };
+    let auth_resp = match parse_service_login_session(
+        &step1_body,
+        &step1_headers,
+        "Xiaomi token refresh",
+    )? {
+        ServiceLoginSession::Authenticated(auth_resp) => auth_resp,
+        ServiceLoginSession::NeedCredential { .. } => {
+            return Err(anyhow!(
+                "saved Xiaomi passToken is no longer accepted for {sid}; credential login is required"
+            ));
+        }
+    };
     if auth_resp.user_id != 0 && auth_resp.user_id.to_string() != user_id {
         return Err(anyhow!(
-            "Xiaomi token refresh returned mismatched userId: expected {}, got {}",
+            "Xiaomi token refresh for {sid} returned mismatched userId: expected {}, got {}",
             user_id,
             auth_resp.user_id
         ));
     }
 
-    let mut refreshed =
-        finish_login_with_auth_response(&client, &cookie_store, auth_resp, ua, user_id, &device_id)
-            .await?;
+    let mut refreshed = finish_service_login_with_auth_response(
+        &client,
+        &cookie_store,
+        auth_resp,
+        ua,
+        user_id,
+        &device_id,
+        sid,
+    )
+    .await?;
     if refreshed.user_id.trim().is_empty() {
         refreshed.user_id = user_id.to_string();
     }
@@ -1586,7 +1734,8 @@ pub async fn refresh_mi_account_token(token: MiAccountToken, ua: String) -> Resu
     }
 
     log::info!(
-        "[MiAccount.Refresh] service token refreshed user_id={} device_id={} service_token_len={}",
+        "[MiAccount.Refresh] service token refreshed sid={} user_id={} device_id={} service_token_len={}",
+        sid,
         refreshed.user_id,
         refreshed.device_id,
         refreshed.service_token.len()
@@ -1615,7 +1764,7 @@ pub async fn fetch_2fa_session_with_cookie(
     let device_id = device_id
         .or(cookie_device_id)
         .unwrap_or_else(random_device_id);
-    let sdk_version = "accountsdk-18.8.15";
+    let sdk_version = XIAOMI_ACCOUNT_SDK_VERSION;
 
     log::info!(
         "[MiAccount.Login] refreshing verified 2FA session from cookie device_id={} cookie_len={}",
@@ -1637,7 +1786,9 @@ pub async fn fetch_2fa_session_with_cookie(
     )?;
 
     let step1 = client
-        .get("https://account.xiaomi.com/pass/serviceLogin?sid=miothealth&_json=true")
+        .get(format!(
+            "https://account.xiaomi.com/pass/serviceLogin?sid={XIAOMI_HEALTH_SID}&_json=true"
+        ))
         .header("User-Agent", ua)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .send()
@@ -1853,7 +2004,7 @@ pub async fn complete_2fa_login_with_cookie(
     cookie_header: String,
     device_id: Option<String>,
 ) -> Result<MiAccountToken> {
-    let sdk_version = "accountsdk-18.8.15";
+    let sdk_version = XIAOMI_ACCOUNT_SDK_VERSION;
     let device_id = device_id
         .or_else(|| extract_cookie_value(&cookie_header, "deviceId"))
         .unwrap_or_else(random_device_id);
@@ -1976,6 +2127,27 @@ async fn finish_login_with_auth_response(
         ));
     }
 
+    finish_service_login_with_auth_response(
+        client,
+        cookie_store,
+        auth_resp,
+        ua,
+        username,
+        device_id,
+        XIAOMI_HEALTH_SID,
+    )
+    .await
+}
+
+async fn finish_service_login_with_auth_response(
+    client: &reqwest::Client,
+    cookie_store: &Arc<CookieStoreMutex>,
+    auth_resp: ServiceLoginAuthRespone,
+    ua: String,
+    username: &str,
+    device_id: &str,
+    sid: &str,
+) -> Result<MiAccountToken> {
     let step3 = client
         .get(&auth_resp.location)
         .header("User-Agent", ua)
@@ -1984,20 +2156,32 @@ async fn finish_login_with_auth_response(
         .await?;
 
     if step3.status() != 200 {
-        return Err(anyhow!("location redirect failed: {}", step3.status()));
+        return Err(anyhow!(
+            "{sid} location redirect failed: {}",
+            step3.status()
+        ));
     }
+    let step3_headers = step3.headers().clone();
+    let final_url = step3.url().clone();
 
-    let store = cookie_store.lock().unwrap();
-    let service_token = store
-        .get("sts-hlth.io.mi.com", "/", "serviceToken")
-        .map(|ck| ck.value().to_string())
-        .ok_or_else(|| anyhow!("serviceToken cookie missing"))?;
+    let service_token = extract_sts_cookie_value(
+        &step3_headers,
+        cookie_store,
+        &final_url,
+        sid,
+        "serviceToken",
+    )
+    .ok_or_else(|| anyhow!("{sid} serviceToken cookie missing"))?;
+    let c_user_id =
+        extract_sts_cookie_value(&step3_headers, cookie_store, &final_url, sid, "cUserId")
+            .unwrap_or_else(|| auth_resp.c_user_id.clone());
 
     log::info!(
-        "[MiAccount.Login] login completed username={} device_id={} c_user_id={} service_token_len={}",
+        "[MiAccount.Login] service login completed sid={} username={} device_id={} c_user_id={} service_token_len={}",
+        sid,
         username,
         device_id,
-        auth_resp.c_user_id,
+        c_user_id,
         service_token.len()
     );
 
@@ -2008,7 +2192,7 @@ async fn finish_login_with_auth_response(
         device_id: device_id.to_string(),
         ssecurity: auth_resp.ssecurity,
         service_token,
-        c_user_id: auth_resp.c_user_id,
+        c_user_id,
         pass_token: auth_resp.pass_token,
         psecurity: auth_resp.psecurity,
     })
