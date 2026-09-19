@@ -53,6 +53,11 @@ pub trait AccountProvider: Send + Sync {
 
     async fn list_accounts(&self) -> anyhow::Result<Vec<AccountRecord>>;
 
+    /// A credential-free snapshot for consumers that must not receive AccountRecord.
+    async fn public_profile(&self) -> anyhow::Result<Option<models::PublicAccountProfile>> {
+        anyhow::bail!("public account profile is not supported by this provider")
+    }
+
     async fn get_account(&self, account_id: &str) -> anyhow::Result<Option<AccountRecord>> {
         let accounts = self.list_accounts().await?;
         Ok(accounts.into_iter().find(|acc| acc.id == account_id))

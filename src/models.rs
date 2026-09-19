@@ -64,3 +64,44 @@ impl Default for AccountRecord {
         }
     }
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum BindingStatus {
+    Linked,
+    Unlinked,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PublicAccountBinding {
+    pub provider: String,
+    pub status: BindingStatus,
+    pub id: Option<String>,
+    pub username: Option<String>,
+    pub display_name: Option<String>,
+    pub avatar: Option<String>,
+}
+
+impl PublicAccountBinding {
+    pub fn unavailable(provider: &str) -> Self {
+        Self {
+            provider: provider.into(),
+            status: BindingStatus::Unavailable,
+            id: None,
+            username: None,
+            display_name: None,
+            avatar: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PublicAccountProfile {
+    pub id: String,
+    pub name: String,
+    pub username: Option<String>,
+    pub avatar: Option<String>,
+    pub source: String,
+    pub bindings: Vec<PublicAccountBinding>,
+}
