@@ -4,7 +4,7 @@ use frontbridge::invoke_frontend;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tauri::AppHandle;
+use frontbridge::runtime::AppHandle;
 
 const METHOD_STORAGE_GET_JSON: &str = "host/storage/local/get_json";
 const METHOD_STORAGE_SET_JSON: &str = "host/storage/local/set_json";
