@@ -4,7 +4,7 @@ use anyhow::{Context, Result, anyhow};
 use cbc::Encryptor;
 use cipher::{BlockEncryptMut, KeyIvInit, block_padding::Pkcs7};
 use crc::{CRC_32_ISO_HDLC, Crc};
-use reqwest::header::{HeaderMap, HeaderValue};
+use hostio::http::{Client, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -303,7 +303,7 @@ fn normalize_optional(value: Option<String>) -> Option<String> {
 }
 
 async fn fetch_vivo_latest_version_once(
-    client: &reqwest::Client,
+    client: &Client,
     device: &str,
     vercode: i32,
     client_id: &str,

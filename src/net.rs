@@ -1,9 +1,10 @@
-use reqwest::{Client, ClientBuilder};
+// 请求由宿主执行（netcfg 的客户端，DoH / 代理设置与原生代码一致）。
+use hostio::http::{Client, ClientBuilder};
 
 pub fn default_client() -> Client {
-    netcfg::default_client()
+    Client::new()
 }
 
 pub fn default_client_builder() -> ClientBuilder {
-    netcfg::default_client_builder()
+    Client::builder()
 }

@@ -13,8 +13,8 @@ use cipher::StreamCipher;
 use md5::Md5;
 use rand::{Rng, distributions::Uniform, rngs::OsRng};
 use rc4::{KeyInit, Rc4, consts::U32};
-use reqwest::header::{HeaderMap, HeaderValue};
-use reqwest_cookie_store::{CookieStore, CookieStoreMutex, RawCookie};
+use hostio::http::cookie::{CookieStore, CookieStoreMutex, RawCookie};
+use hostio::http::{Client, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
@@ -2081,7 +2081,7 @@ pub async fn complete_2fa_login_with_cookie(
 }
 
 async fn finish_login_with_auth_response(
-    client: &reqwest::Client,
+    client: &Client,
     cookie_store: &Arc<CookieStoreMutex>,
     auth_resp: ServiceLoginAuthRespone,
     ua: String,
@@ -2140,7 +2140,7 @@ async fn finish_login_with_auth_response(
 }
 
 async fn finish_service_login_with_auth_response(
-    client: &reqwest::Client,
+    client: &Client,
     cookie_store: &Arc<CookieStoreMutex>,
     auth_resp: ServiceLoginAuthRespone,
     ua: String,
