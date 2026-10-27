@@ -28,6 +28,18 @@ const XIAOMI_ACCOUNT_SDK_VERSION: &str = "accountsdk-18.8.15";
 const XIAOMI_HEALTH_SID: &str = "miothealth";
 const XIAOMI_PROFILE_SID: &str = "passportapi";
 const XIAOMI_CORE_INFO_URL: &str = "https://api.account.xiaomi.com/pass/v2/safe/user/coreInfo";
+/// Mi Fitness health hosts, one per data center (IDC). A device is kept in the
+/// IDC it was bound in, which can differ from the account's own region (a
+/// band bound outside China lives on sg.hlth.io.mi.com while the CN host
+/// answers `list: null`), so bound devices are looked up on all of them.
+const XIAOMI_HEALTH_HOSTS: [&str; 6] = [
+    "hlth.io.mi.com",
+    "sg.hlth.io.mi.com",
+    "de.hlth.io.mi.com",
+    "ru.hlth.io.mi.com",
+    "us.hlth.io.mi.com",
+    "i2.hlth.io.mi.com",
+];
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ServiceLoginAuthRespone {
@@ -110,7 +122,17 @@ pub struct DeviceInfo {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct DeviceListResult {
+    /// The server sends `null` rather than `[]` when it has no device
+    #[serde(default, deserialize_with = "null_as_default")]
     pub list: Vec<DeviceInfo>,
+}
+
+fn null_as_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -883,6 +905,7 @@ async fn mi_service_call_encrypted_internal(
 
     let url_parsed = Url::parse(&url)?;
     let url_path = resolve_service_signature_path(url_parsed.path(), &path_prefix);
+    let region_tag = health_region_tag(url_parsed.host_str());
 
     let rc4_hash = generate_enc_signature(&url_path, "POST", &signed_nonce, &signed_form_params);
     signed_form_params.insert("rc4_hash__".to_string(), rc4_hash);
@@ -897,7 +920,7 @@ async fn mi_service_call_encrypted_internal(
 
     let mut headers = HeaderMap::new();
     headers.insert("User-Agent", HeaderValue::from_str(&ua)?);
-    headers.insert("region_tag", HeaderValue::from_static("cn"));
+    headers.insert("region_tag", HeaderValue::from_str(region_tag)?);
     headers.insert("HandleParams", HeaderValue::from_static("true"));
 
     let mut cookie_parts = vec![
@@ -946,6 +969,14 @@ async fn mi_service_call_encrypted_internal(
     let mut data = general_purpose::STANDARD.decode(body.trim_matches('"'))?;
     cipher.apply_keystream(&mut data);
     Ok(String::from_utf8_lossy(&data).into_owned())
+}
+
+/// `region_tag` header for a health host: its IDC prefix ("sg" for
+/// sg.hlth.io.mi.com), and "cn" for the CN host and any other host.
+fn health_region_tag(host: Option<&str>) -> &str {
+    host.and_then(|host| host.strip_suffix(".hlth.io.mi.com"))
+        .filter(|tag| !tag.is_empty() && !tag.contains('.'))
+        .unwrap_or("cn")
 }
 
 /// Main encrypted API call.
@@ -1120,6 +1151,68 @@ async fn request_mi_user_core_info_with_token(
     }
 
     Ok(profile)
+}
+
+/// Devices bound to the account in Mi Fitness, from every health host (see
+/// `XIAOMI_HEALTH_HOSTS`). A host that fails is skipped; this fails only when
+/// none of them answers.
+pub async fn fetch_mi_bound_devices(token: MiAccountToken, ua: String) -> Result<Vec<DeviceInfo>> {
+    let mut signed_form = HashMap::new();
+    signed_form.insert(
+        "data".to_string(),
+        serde_json::json!({ "page_size": 50, "status": 1 }).to_string(),
+    );
+
+    let mut devices: Vec<DeviceInfo> = Vec::new();
+    let mut answered = false;
+    let mut last_error = None;
+    for host in XIAOMI_HEALTH_HOSTS {
+        let url = format!("https://{host}/app/v1/source/get_source_list");
+        let response = match mi_service_call_encrypted(
+            token.clone(),
+            String::new(),
+            url,
+            signed_form.clone(),
+            ua.clone(),
+        )
+        .await
+        .and_then(|body| serde_json::from_str::<DeviceListRespone>(&body).map_err(Into::into))
+        {
+            Ok(response) if response.code == 0 => response,
+            Ok(response) => {
+                log::warn!(
+                    "[MiAccount.Devices] {host}: code={} msg={}",
+                    response.code,
+                    response.message
+                );
+                last_error = Some(anyhow!("{host}: {}", response.message));
+                continue;
+            }
+            Err(err) => {
+                log::warn!("[MiAccount.Devices] {host}: {err}");
+                last_error = Some(err);
+                continue;
+            }
+        };
+        answered = true;
+        log::info!(
+            "[MiAccount.Devices] {host}: {} device(s)",
+            response.result.list.len()
+        );
+        for device in response.result.list {
+            if !devices
+                .iter()
+                .any(|known| known.identifier == device.identifier)
+            {
+                devices.push(device);
+            }
+        }
+    }
+
+    if !answered {
+        return Err(last_error.unwrap_or_else(|| anyhow!("no Mi Fitness host answered")));
+    }
+    Ok(devices)
 }
 
 pub async fn fetch_mi_user_core_info(
@@ -2196,4 +2289,33 @@ async fn finish_service_login_with_auth_response(
         pass_token: auth_resp.pass_token,
         psecurity: auth_resp.psecurity,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn device_list_accepts_null_list() {
+        let response: DeviceListRespone =
+            serde_json::from_str(r#"{"code":0,"message":"ok","result":{"list":null}}"#).unwrap();
+        assert!(response.result.list.is_empty());
+    }
+
+    #[test]
+    fn device_list_accepts_missing_list() {
+        let response: DeviceListRespone =
+            serde_json::from_str(r#"{"code":0,"message":"ok","result":{}}"#).unwrap();
+        assert!(response.result.list.is_empty());
+    }
+
+    #[test]
+    fn region_tag_follows_health_host() {
+        assert_eq!(health_region_tag(Some("hlth.io.mi.com")), "cn");
+        assert_eq!(health_region_tag(Some("sg.hlth.io.mi.com")), "sg");
+        assert_eq!(health_region_tag(Some("i2.hlth.io.mi.com")), "i2");
+        assert_eq!(health_region_tag(Some("sts-hlth.io.mi.com")), "cn");
+        assert_eq!(health_region_tag(Some("api.account.xiaomi.com")), "cn");
+        assert_eq!(health_region_tag(None), "cn");
+    }
 }
